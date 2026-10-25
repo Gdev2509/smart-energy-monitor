@@ -1,129 +1,168 @@
 
-import random
+import json
+import time
+import threading
 from datetime import datetime
 
 import pandas as pd
 import streamlit as st
+import paho.mqtt.client as mqtt
 from streamlit_autorefresh import st_autorefresh
 
-# ---------------- PAGE CONFIGURATION ----------------
+BROKER = "broker.hivemq.com"
+PORT = 1883
+TOPIC = "smartenergy/Gdev2509/telemetry"
+
+
+@st.cache_resource
+def start_mqtt():
+    # Shared data store updated by the MQTT callback thread.
+    store = {
+        "latest": None,
+        "history": [],
+        "connected": False,
+        "error": None,
+        "lock": threading.Lock(),
+    }
+
+    def on_connect(client, userdata, flags, reason_code, properties):
+        if reason_code == 0:
+            with store["lock"]:
+                store["connected"] = True
+                store["error"] = None
+            client.subscribe(TOPIC)
+        else:
+            with store["lock"]:
+                store["connected"] = False
+                store["error"] = f"MQTT connection refused: {reason_code}"
+
+    def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+        with store["lock"]:
+            store["connected"] = False
+            if reason_code != 0:
+                store["error"] = f"MQTT disconnected: {reason_code}"
+
+    def on_message(client, userdata, message):
+        try:
+            reading = json.loads(message.payload.decode("utf-8"))
+
+            required = ["voltage", "current", "power", "energy"]
+            if not all(key in reading for key in required):
+                raise ValueError("Missing required reading")
+
+            reading["received_at"] = datetime.now().strftime("%H:%M:%S")
+
+            with store["lock"]:
+                store["latest"] = reading
+                store["history"].append(reading)
+                store["history"] = store["history"][-150:]
+                store["error"] = None
+
+        except (ValueError, UnicodeDecodeError, TypeError) as exc:
+            with store["lock"]:
+                store["error"] = f"Invalid MQTT message: {exc}"
+
+    client = mqtt.Client(
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+        client_id=f"streamlit-energy-{int(time.time())}",
+        protocol=mqtt.MQTTv311,
+    )
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message = on_message
+
+    try:
+        client.connect(BROKER, PORT, keepalive=60)
+        client.loop_start()
+    except Exception as exc:
+        store["error"] = f"Cannot connect to MQTT broker: {exc}"
+
+    return client, store
+
+
 st.set_page_config(
-    page_title="Smart Energy Monitor",
+    page_title="Smart Energy Monitoring",
     page_icon="⚡",
-    layout="wide"
+    layout="wide",
 )
 
 st.title("⚡ Smart Energy Monitoring System")
-st.caption("Virtual Idea Lab Project | Simulated data — no physical meter")
+st.caption("Virtual ESP32 → MQTT → Streamlit | Simulated electrical readings")
 
-# ---------------- SETTINGS ----------------
 tariff = st.sidebar.number_input(
-    "Electricity tariff (₹/kWh)",
-    min_value=0.0,
-    max_value=100.0,
-    value=8.0,
-    step=0.5
+    "Tariff (₹/kWh)", min_value=0.0, value=8.0, step=0.5
 )
 
 alert_limit = st.sidebar.slider(
-    "High power alert threshold (W)",
+    "High-power alert (W)",
     min_value=100,
     max_value=2000,
     value=500,
-    step=50
+    step=50,
 )
 
-if "records" not in st.session_state:
-    st.session_state.records = []
-    st.session_state.energy_kwh = 0.0
-    st.session_state.last_time = datetime.now()
+st_autorefresh(interval=2000, key="mqtt_refresh")
 
-# Refresh the dashboard every 2 seconds
-st_autorefresh(interval=2000, key="energy_refresh")
+client, store = start_mqtt()
 
-# ---------------- SIMULATE ELECTRICAL LOAD ----------------
-now = datetime.now()
-elapsed_seconds = (
-    now - st.session_state.last_time
-).total_seconds()
+with store["lock"]:
+    connected = store["connected"]
+    latest = dict(store["latest"]) if store["latest"] else None
+    history = list(store["history"])
+    error = store["error"]
 
-# Prevent a long browser pause from creating a huge energy jump
-elapsed_seconds = min(max(elapsed_seconds, 0), 10)
+if connected:
+    st.success(f"MQTT connected · Topic: {TOPIC}")
+else:
+    st.warning("Waiting for an MQTT connection and ESP32 readings.")
+    if error:
+        st.code(error)
 
-voltage = 230.0
-current = random.uniform(0.30, 2.00)
+if latest is None:
+    st.info(
+        "Start your Wokwi simulation and wait for the first MQTT message."
+    )
+    st.stop()
 
-# Approximation for a resistive load, power factor = 1
-power = voltage * current
-
-# Energy in kWh = power in W x time in hours / 1000
-st.session_state.energy_kwh += (
-    power * elapsed_seconds / 3600000
-)
-
-st.session_state.last_time = now
-
-energy = st.session_state.energy_kwh
+voltage = float(latest["voltage"])
+current = float(latest["current"])
+power = float(latest["power"])
+energy = float(latest["energy"])
 cost = energy * tariff
 
-st.session_state.records.append({
-    "Time": now,
-    "Voltage (V)": voltage,
-    "Current (A)": round(current, 2),
-    "Power (W)": round(power, 1),
-    "Energy (kWh)": round(energy, 6),
-    "Cost (₹)": round(cost, 4)
-})
-
-# Keep recent readings for charts
-st.session_state.records = st.session_state.records[-150:]
-df = pd.DataFrame(st.session_state.records)
-
-# ---------------- LIVE METRICS ----------------
-m1, m2, m3, m4 = st.columns(4)
-
-m1.metric("Voltage", f"{voltage:.1f} V")
-m2.metric("Current", f"{current:.2f} A")
-m3.metric("Power", f"{power:.1f} W")
-m4.metric("Energy", f"{energy:.6f} kWh")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Voltage", f"{voltage:.1f} V")
+c2.metric("Current", f"{current:.2f} A")
+c3.metric("Power", f"{power:.1f} W")
+c4.metric("Energy", f"{energy:.6f} kWh")
 
 st.metric("Estimated Energy Cost", f"₹{cost:.4f}")
 
-# ---------------- ALERT ----------------
 if power >= alert_limit:
-    st.error(
-        f"High power alert: {power:.1f} W "
-        f"is above your {alert_limit} W threshold."
-    )
+    st.error(f"High power alert: {power:.1f} W")
 else:
-    st.success("Power is within the configured threshold.")
+    st.success("Power is below the configured alert threshold.")
 
-# ---------------- CHARTS ----------------
-st.subheader("Live Power Consumption")
-st.line_chart(
-    df.set_index("Time")[["Power (W)"]]
+df = pd.DataFrame(history)
+
+if not df.empty:
+    st.subheader("Live Power Consumption")
+    st.line_chart(df.set_index("received_at")[["power"]])
+
+    st.subheader("Cumulative Energy")
+    st.line_chart(df.set_index("received_at")[["energy"]])
+
+    st.subheader("Latest MQTT Readings")
+    st.dataframe(df.tail(10), use_container_width=True)
+
+    st.download_button(
+        "Download MQTT readings (CSV)",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name="smart_energy_readings.csv",
+        mime="text/csv",
+    )
+
+st.caption(
+    "Values are simulated. The dashboard displays the latest MQTT messages "
+    "received while its MQTT listener is running."
 )
-
-st.subheader("Energy Consumption")
-st.line_chart(
-    df.set_index("Time")[["Energy (kWh)"]]
-)
-
-st.subheader("Recent Readings")
-st.dataframe(df.tail(10), use_container_width=True)
-
-# ---------------- DOWNLOAD ----------------
-csv_data = df.to_csv(index=False).encode("utf-8")
-
-st.download_button(
-    "Download Readings as CSV",
-    data=csv_data,
-    file_name="energy_readings.csv",
-    mime="text/csv"
-)
-
-if st.button("Reset Energy Counter"):
-    st.session_state.energy_kwh = 0.0
-    st.session_state.records = []
-    st.session_state.last_time = datetime.now()
-    st.rerun()
